@@ -34,7 +34,9 @@ import io.airbyte.data.repositories.entities.Actor
 import io.airbyte.data.services.CatalogService
 import io.airbyte.data.services.DestinationService
 import io.airbyte.data.services.SourceService
+import io.airbyte.featureflag.Empty
 import io.airbyte.featureflag.FeatureFlagClient
+import io.airbyte.featureflag.ReplicationCommandFallsBackToWorkloadStatus
 import io.airbyte.micronaut.runtime.AirbyteConfig
 import io.airbyte.micronaut.runtime.AirbyteWorkerConfig
 import io.airbyte.persistence.job.models.IntegrationLauncherConfig
@@ -1211,6 +1213,64 @@ class CommandServiceTest {
     every { workloadOutputReader.readSyncOutput(WORKLOAD_ID) } returns expectedOutput
     val output = service.getReplicationOutput(COMMAND_ID)
     assertEquals(expectedOutput, output)
+  }
+
+  @ParameterizedTest
+  @CsvSource(
+    "launch,false",
+    "launch,true",
+    "workload-monitor-heartbeat,false",
+    "workload-monitor-heartbeat,true",
+    "airbyte_platform,false",
+    "airbyte_platform,true",
+  )
+  fun `getReplicationOutput marks failed workloads as FAILED without the status fallback flag`(
+    terminationSource: String,
+    outputReadFails: Boolean,
+  ) {
+    val terminationReason = "Replication workload failed before producing an output"
+    every { featureFlagClient.boolVariation(ReplicationCommandFallsBackToWorkloadStatus, Empty) } returns false
+    every { workloadService.getWorkload(WORKLOAD_ID) } returns
+      mockk {
+        every { status } returns WorkloadStatus.FAILURE
+        every { this@mockk.terminationSource } returns terminationSource
+        every { this@mockk.terminationReason } returns terminationReason
+      }
+    if (outputReadFails) {
+      every { workloadOutputReader.readSyncOutput(WORKLOAD_ID) } throws DocStoreAccessException("Cannot read replication output", Exception("boom"))
+    } else {
+      every { workloadOutputReader.readSyncOutput(WORKLOAD_ID) } returns null
+    }
+
+    val output = service.getReplicationOutput(COMMAND_ID)!!
+
+    assertEquals(StandardSyncSummary.ReplicationStatus.FAILED, output.replicationAttemptSummary?.status)
+    val failure = output.failures.single()
+    assertEquals(FailureReason.FailureOrigin.AIRBYTE_PLATFORM, failure.failureOrigin)
+    assertEquals(FailureReason.FailureType.SYSTEM_ERROR, failure.failureType)
+    assertEquals(terminationReason, failure.externalMessage)
+    assertEquals(terminationReason, failure.internalMessage)
+    assertNotNull(failure.timestamp)
+  }
+
+  @Test
+  fun `getReplicationOutput preserves a completed sync with zero records`() {
+    val expectedOutput =
+      ReplicationOutput()
+        .withReplicationAttemptSummary(
+          ReplicationAttemptSummary()
+            .withStatus(StandardSyncSummary.ReplicationStatus.COMPLETED)
+            .withRecordsSynced(0L)
+            .withBytesSynced(0L),
+        )
+    every { workloadOutputReader.readSyncOutput(WORKLOAD_ID) } returns expectedOutput
+
+    val output = service.getReplicationOutput(COMMAND_ID)
+
+    assertEquals(expectedOutput, output)
+    assertEquals(StandardSyncSummary.ReplicationStatus.COMPLETED, output!!.replicationAttemptSummary.status)
+    assertEquals(0L, output.replicationAttemptSummary.recordsSynced)
+    verify(exactly = 0) { workloadService.getWorkload(any()) }
   }
 
   @ParameterizedTest

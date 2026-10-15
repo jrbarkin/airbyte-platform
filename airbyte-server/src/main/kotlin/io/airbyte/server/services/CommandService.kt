@@ -1036,7 +1036,11 @@ class CommandService(
 
           val fallbackOutput = ReplicationOutput().withFailures(listOf(failureReason))
 
-          if (featureFlagClient.boolVariation(ReplicationCommandFallsBackToWorkloadStatus, Empty)) {
+          // Missing replication output must not hide a known workload failure.
+          if (
+            workload.status == WorkloadStatus.FAILURE ||
+            featureFlagClient.boolVariation(ReplicationCommandFallsBackToWorkloadStatus, Empty)
+          ) {
             // Fallback to the workload status when we can't read the output
             if (workload.status == WorkloadStatus.FAILURE) {
               fallbackOutput.replicationAttemptSummary =
